@@ -146,7 +146,17 @@ without restarting the terminal.
   read the image at that path. This does not emulate a native image attachment.
 - **Middle click:** paste the primary text selection, including in mouse-aware
   TUIs. Both mouse bindings take precedence over application mouse handling.
-  Ctrl+Shift+V keeps kitty's native clipboard behavior.
+  Ctrl+Shift+V keeps kitty's native clipboard behavior outside SSH.
+- **Over SSH:** in a pane running an `ssh` client, right click, Ctrl+Shift+V
+  and Ctrl+V upload a clipboard PNG over a second connection with the same
+  options and paste the remote path, so remote agent CLIs attach it like a
+  local screenshot. A left click on a link opens it on this machine, even when
+  a full-screen TUI owns the mouse; the program still receives the click.
+  Text pastes and remote OSC 52 clipboard writes work as usual. The second
+  connection must log in without a prompt (key or agent); a failed upload shows
+  an error and pastes nothing. Only the outermost `ssh` is known, so with nested
+  sessions the image lands on the first host. `config/ssh_input.conf` with both
+  kittens can be included from a kitty that does not use Astro.
 
 Screenshots stay in `${XDG_CACHE_HOME:-~/.cache}/astro/clipboard` with private
 permissions. When saving a new screenshot, Astro retains up to 50 recent

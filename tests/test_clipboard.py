@@ -52,7 +52,7 @@ class ClipboardTests(unittest.TestCase):
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        window = Mock()
+        window = Mock(child=SimpleNamespace(foreground_processes=[]))
         boss = SimpleNamespace(window_id_map={42: window})
         path = "/home/example/cache dir/it's a screenshot.png"
         module.handle_result([], path, 42, boss)

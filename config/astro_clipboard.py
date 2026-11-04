@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Paste clipboard screenshots as private files without changing the clipboard."""
+"""Paste clipboard screenshots as private files without changing the clipboard.
+
+In a pane running an ssh client the file is uploaded over a second connection
+with the same options, so the pasted path exists where the remote program runs.
+"""
 import os
 from pathlib import Path
 import select
@@ -14,6 +18,28 @@ from kittens.tui.handler import result_handler
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_SAVED_IMAGES = 50
 MAX_IMAGE_AGE_SECONDS = 7 * 86400
+UPLOAD_TIMEOUT_SECONDS = 30
+UPLOAD_POLL_SECONDS = 0.05
+
+# Options that decide where and how ssh connects. Everything else, such as
+# port forwards, must not be repeated by the upload connection.
+SSH_CONNECTION_OPTIONS = frozenset('BbcFiJlmoPpS')
+SSH_VALUE_OPTIONS = SSH_CONNECTION_OPTIONS | frozenset('DEeILOQRWw')
+SSH_CONNECTION_FLAGS = frozenset('46')
+# ssh keeps the first value of an option, so these win over the user's config.
+SSH_UPLOAD_OPTIONS = ('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'ClearAllForwardings=yes',
+                      '-o', 'RemoteCommand=none', '-o', 'RequestTTY=no')
+# POSIX sh: same private directory and limits as the local cache, which also
+# leaves symlinks alone.
+REMOTE_SAVE_SCRIPT = (
+    'umask 077; dir="${XDG_CACHE_HOME:-$HOME/.cache}/astro/clipboard"; mkdir -p "$dir" || exit; '
+    'file=$(mktemp "$dir/screenshot-XXXXXXXXXX") || exit; '
+    'if ! cat >"$file" || ! mv "$file" "$file.png"; then rm -f "$file"; exit 1; fi; '
+    'saved() { find "$dir" -maxdepth 1 -type f -name "screenshot-*.png" "$@"; }; '
+    f'saved -mtime +{MAX_IMAGE_AGE_SECONDS // 86400} -exec rm -f {{}} +; '
+    f'saved -exec ls -1t {{}} + | tail -n +{MAX_SAVED_IMAGES + 1} | '
+    'while IFS= read -r old; do rm -f "$old"; done; printf "%s\\n" "$file.png"'
+)
 
 
 def _prune_clipboard_cache(cache: Path, keep: Path | None = None) -> None:
@@ -116,6 +142,98 @@ def clipboard_image() -> str:
         return ''
 
 
+def ssh_connection_args(cmdline: list[str]) -> list[str] | None:
+    """Return the options and destination of an ssh client command line."""
+    connection: list[str] = []
+    arguments = iter(cmdline[1:])
+    for argument in arguments:
+        if argument == '--':
+            argument = next(arguments, '')
+        elif argument.startswith('-') and len(argument) > 1:
+            letters = argument[1:]
+            for index, letter in enumerate(letters):
+                if letter in SSH_VALUE_OPTIONS:
+                    value = letters[index + 1:] or next(arguments, None)
+                    if value is None:
+                        return None
+                    if letter in SSH_CONNECTION_OPTIONS:
+                        connection += [f'-{letter}', value]
+                    break
+                if letter in SSH_CONNECTION_FLAGS:
+                    connection.append(f'-{letter}')
+            continue
+        return connection + ['--', argument] if argument else None
+    return None
+
+
+def ssh_upload_command(cmdline: list[str]) -> list[str] | None:
+    """Build the command that stores stdin next to the remote program."""
+    connection = ssh_connection_args(cmdline)
+    if connection is None:
+        return None
+    return [cmdline[0], *SSH_UPLOAD_OPTIONS, *connection, 'sh -c ' + shlex.quote(REMOTE_SAVE_SCRIPT)]
+
+
+def window_ssh_cmdline(window) -> list[str] | None:
+    """Return the command line of the ssh client running in the pane, if any."""
+    for process in window.child.foreground_processes:
+        cmdline = process.get('cmdline') or []
+        if cmdline and Path(cmdline[0]).name == 'ssh':
+            return list(cmdline)
+    return None
+
+
+def report_upload_failure(boss, detail: str) -> None:
+    german = (os.environ.get('LC_ALL') or os.environ.get('LC_MESSAGES') or os.environ.get('LANG', '')).startswith('de')
+    title = 'Bild nicht eingefügt' if german else 'Image not pasted'
+    text = 'Upload über SSH fehlgeschlagen' if german else 'Upload over SSH failed'
+    boss.show_error(title, f'{text}: {detail}' if detail else text)
+
+
+def upload_image(boss, window_id: int, image_path: str, command: list[str]) -> None:
+    """Upload without blocking kitty, then paste the remote path."""
+    from kitty.fast_data_types import add_timer, remove_timer
+
+    local = Path(image_path)
+    output = tempfile.TemporaryFile()
+    errors = tempfile.TemporaryFile()
+    try:
+        with local.open('rb') as image:
+            process = subprocess.Popen(command, stdin=image, stdout=output, stderr=errors, start_new_session=True)
+    except OSError as error:
+        output.close()
+        errors.close()
+        local.unlink(missing_ok=True)
+        report_upload_failure(boss, str(error))
+        return
+    deadline = time.monotonic() + UPLOAD_TIMEOUT_SECONDS
+
+    def poll(timer_id: int) -> None:
+        status = process.poll()
+        if status is None:
+            if time.monotonic() < deadline:
+                return
+            process.kill()
+            status = process.wait()
+        remove_timer(timer_id)
+        output.seek(0)
+        errors.seek(0)
+        lines = output.read(4096).decode(errors='replace').strip().splitlines()
+        detail = errors.read(4096).decode(errors='replace').strip()
+        output.close()
+        errors.close()
+        local.unlink(missing_ok=True)
+        remote = lines[-1] if lines else ''
+        if status != 0 or not (remote.startswith('/') and remote.endswith('.png')):
+            report_upload_failure(boss, detail.splitlines()[-1] if detail else f'exit {status}')
+            return
+        window = boss.window_id_map.get(window_id)
+        if window is not None:
+            window.paste_with_actions(shlex.quote(remote) + ' ')
+
+    add_timer(poll, UPLOAD_POLL_SECONDS, True)
+
+
 def main(args: list[str]) -> str:
     return clipboard_image()
 
@@ -126,7 +244,16 @@ def handle_result(args, image_path, target_window_id, boss):
     if window is None:
         return
     if image_path:
-        window.paste_with_actions(shlex.quote(image_path) + ' ')
+        ssh_cmdline = window_ssh_cmdline(window)
+        if ssh_cmdline is None:
+            window.paste_with_actions(shlex.quote(image_path) + ' ')
+            return
+        command = ssh_upload_command(ssh_cmdline)
+        if command is None:
+            Path(image_path).unlink(missing_ok=True)
+            report_upload_failure(boss, ' '.join(ssh_cmdline))
+            return
+        upload_image(boss, target_window_id, image_path, command)
     else:
         # Target the clicked pane, not whichever pane is now active.
         from kitty.clipboard import get_clipboard_string

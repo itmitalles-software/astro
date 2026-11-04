@@ -45,7 +45,7 @@ font_dir=$data_dir/fonts/astro-pane-controls
 bin_dir=${ASTRO_BIN_DIRECTORY:-$HOME/.local/bin}
 bashrc=${ASTRO_BASHRC:-$HOME/.bashrc}
 supported=0.49.2
-config_files='kitty.conf window_title_bar.py reload_pane_controls.py astro_clipboard.py astro_intro.py astro.bash astro_prompt.bash sessions/default.conf'
+config_files='kitty.conf window_title_bar.py reload_pane_controls.py astro_clipboard.py astro_remote.py ssh_input.conf astro_intro.py astro.bash astro_prompt.bash sessions/default.conf'
 replace_session=${ASTRO_REPLACE_SESSION:-0}
 
 if [ "$mode" = restore ]; then
